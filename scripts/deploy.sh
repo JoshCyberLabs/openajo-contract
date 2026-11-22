@@ -3,17 +3,9 @@
 #   reputation -> circle -> set_reporter wiring.
 # Usage: ./scripts/deploy.sh   (override IDENT/NETWORK via env)
 #
-# Testnet (default): funds the identity via friendbot and is safe to run
-# unattended.
-# Mainnet: friendbot does not exist, so this script never funds on mainnet —
-#   the deployer must fund the identity out of band first, then opt in
-#   explicitly with CONFIRM_MAINNET=1. A summary is printed before any
-#   transaction is sent, so nothing is deployed by accident.
-#
-# Resuming a partial deploy: pass the ids that were already created so those
-# steps are skipped instead of deploying duplicates, e.g. after step 4 failed:
-#   REPUTATION_CONTRACT_ID=C... ./scripts/deploy.sh
-#   REPUTATION_CONTRACT_ID=C... CIRCLE_CONTRACT_ID=C... ./scripts/deploy.sh
+# Resuming a partial run: if a previous run already deployed a contract, pass
+# its id back through the environment (REPUTATION_CONTRACT_ID /
+# CIRCLE_CONTRACT_ID) and that step is skipped instead of deploying a duplicate.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -42,6 +34,11 @@ any transaction is sent; set CONFIRM_MAINNET=1 to proceed.
 EOF
   exit 1
 fi
+
+# Accept already-deployed contract ids so a failed run can be resumed without
+# redeploying (and replacing) contracts that already exist on-chain.
+REP_ID="${REPUTATION_CONTRACT_ID:-${REP_ID:-}}"
+CIRCLE_ID="${CIRCLE_CONTRACT_ID:-${CIRCLE_ID:-}}"
 
 echo "[1/5] identity ($IDENT on $NET)"
 if [ "$NET" = "mainnet" ]; then
@@ -75,25 +72,23 @@ echo "[2/5] build wasm"
 stellar contract build
 
 if [ -n "$REP_ID" ]; then
-  echo "[3/5] reusing existing reputation: $REP_ID"
+  echo "[3/5] reputation already deployed ($REP_ID) — skipping"
 else
   echo "[3/5] deploy reputation"
   REP_ID=$(stellar contract deploy \
     --wasm target/wasm32v1-none/release/reputation.wasm \
     --source "$IDENT" --network "$NET")
-  echo "      REPUTATION_CONTRACT_ID=$REP_ID"
   stellar contract invoke --id "$REP_ID" --source "$IDENT" --network "$NET" --send=yes \
     -- initialize --admin "$ADMIN"
 fi
 
 if [ -n "$CIRCLE_ID" ]; then
-  echo "[4/5] reusing existing circle: $CIRCLE_ID"
+  echo "[4/5] circle already deployed ($CIRCLE_ID) — skipping"
 else
   echo "[4/5] deploy circle"
   CIRCLE_ID=$(stellar contract deploy \
     --wasm target/wasm32v1-none/release/circle.wasm \
     --source "$IDENT" --network "$NET")
-  echo "      CIRCLE_CONTRACT_ID=$CIRCLE_ID"
   stellar contract invoke --id "$CIRCLE_ID" --source "$IDENT" --network "$NET" --send=yes \
     -- initialize --admin "$ADMIN" --reputation "$REP_ID"
 fi
