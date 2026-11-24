@@ -291,6 +291,87 @@ impl CircleContract {
     pub fn total_circles(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Count).unwrap_or(0)
     }
+
+    /// Returns the members who have not yet paid in the current cycle,
+    /// excluding any member who has defaulted (they can never pay again).
+    pub fn get_unpaid(env: Env, circle_id: u32) -> Vec<Address> {
+        let circle = storage::read_circle(&env, circle_id);
+        let members = storage::read_members(&env, circle_id);
+        let cycle = circle.current_cycle;
+        let mut unpaid = vec![&env];
+        for m in members.iter() {
+            let st = storage::read_member(&env, circle_id, &m);
+            if !st.defaulted && !storage::is_paid(&env, circle_id, cycle, &m) {
+                unpaid.push_back(m);
+            }
+        }
+        unpaid
+    }
+
+    /// Returns the first member in join order who is active (not defaulted)
+    /// and has not yet received the pot, or `None` when every active member
+    /// has already been paid out.
+    pub fn next_recipient(env: Env, circle_id: u32) -> Option<Address> {
+        let members = storage::read_members(&env, circle_id);
+        for m in members.iter() {
+            let st = storage::read_member(&env, circle_id, &m);
+            if !st.received && !st.defaulted {
+                return Some(m);
+            }
+        }
+        None
+    }
+
+    /// Returns `true` when the current cycle is ready to settle: either every
+    /// active member has already contributed, or the cycle deadline has passed.
+    /// Returns `false` for circles that are not currently Active.
+    pub fn is_due(env: Env, circle_id: u32) -> bool {
+        let circle = storage::read_circle(&env, circle_id);
+        if circle.status != CircleStatus::Active {
+            return false;
+        }
+        let members = storage::read_members(&env, circle_id);
+        let cycle = circle.current_cycle;
+        let now = env.ledger().timestamp();
+        let deadline = circle.started_at + (cycle as u64 + 1) * circle.period_secs;
+        if now > deadline {
+            return true;
+        }
+        for m in members.iter() {
+            let st = storage::read_member(&env, circle_id, &m);
+            if st.defaulted {
+                continue;
+            }
+            if !storage::is_paid(&env, circle_id, cycle, &m) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns the pot that would be collected if `settle_cycle` ran right now:
+    /// each active member's contribution when they have paid, or the slash
+    /// amount (`min(deposit_remaining, contribution)`) when they have not.
+    /// Defaulted members do not contribute to the pot.
+    pub fn pot_preview(env: Env, circle_id: u32) -> i128 {
+        let circle = storage::read_circle(&env, circle_id);
+        let members = storage::read_members(&env, circle_id);
+        let cycle = circle.current_cycle;
+        let mut pot: i128 = 0;
+        for m in members.iter() {
+            let st = storage::read_member(&env, circle_id, &m);
+            if st.defaulted {
+                continue;
+            }
+            if storage::is_paid(&env, circle_id, cycle, &m) {
+                pot += circle.contribution;
+            } else {
+                let slash = core::cmp::min(st.deposit_remaining, circle.contribution);
+                pot += slash;
+            }
+        }
+        pot
+    }
 }
 
 mod test;
@@ -303,3 +384,5 @@ mod test_invariants;
 mod test_reputation;
 
 mod test_cost;
+
+mod test_views;
