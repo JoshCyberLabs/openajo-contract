@@ -19,10 +19,13 @@ mod validation;
 
 use errors::Error;
 use soroban_sdk::{
-    contract, contractclient, contractimpl, panic_with_error, token, vec, Address, Env, Vec,
+    contract, contractclient, contractimpl, panic_with_error, token, vec, Address, Env, String, Vec,
 };
 use ttl_helpers::{extend_instance, extend_persistent};
 use types::{Circle, CircleStatus, DataKey, GlobalConfig, MemberState};
+
+/// Maximum number of circles returned by `get_circles` per call.
+pub const MAX_PAGE_SIZE: u32 = 50;
 
 /// Shortest cycle a circle may run, in seconds (one hour).
 ///
@@ -84,57 +87,40 @@ impl CircleContract {
         size: u32,
         period_secs: u64,
     ) -> u32 {
-        creator.require_auth();
-        validation::validate_create_params(contribution, deposit, size, period_secs, &env);
-
-        let config: GlobalConfig = storage::read_config(&env);
-        let open_key = DataKey::OpenCircles(creator.clone());
-        let open_count: u32 = env.storage().persistent().get(&open_key).unwrap_or(0);
-        if open_count >= config.open_circle_cap {
-            panic_with_error!(&env, Error::OpenCircleCapExceeded);
-        }
-
-        let id: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
-
-        if deposit > 0 {
-            token::Client::new(&env, &token).transfer(
-                &creator,
-                env.current_contract_address(),
-                &deposit,
-            );
-        }
-
-        let circle = Circle {
-            creator: creator.clone(),
+        create_circle_inner(
+            env,
+            creator,
             token,
             contribution,
             deposit,
             size,
             period_secs,
-            status: CircleStatus::Open,
-            started_at: 0,
-            current_cycle: 0,
-            slashed_total: 0,
-            ended_at: 0,
-        };
-        storage::write_circle(&env, id, &circle);
-        storage::write_members(&env, id, &vec![&env, creator.clone()]);
-        storage::write_member(
-            &env,
-            id,
-            &creator,
-            &MemberState {
-                deposit_remaining: deposit,
-                received: false,
-                defaulted: false,
-            },
-        );
-        env.storage().instance().set(&DataKey::Count, &(id + 1));
-        env.storage().persistent().set(&open_key, &(open_count + 1));
-        extend_persistent(&env, &open_key);
-        extend_instance(&env);
-        events::create(&env, id, &creator);
-        id
+            0,
+        )
+    }
+
+    /// Creator only: open a new circle with a configured settlement grace period.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_circle_with_grace(
+        env: Env,
+        creator: Address,
+        token: Address,
+        contribution: i128,
+        deposit: i128,
+        size: u32,
+        period_secs: u64,
+        grace_secs: u64,
+    ) -> u32 {
+        create_circle_inner(
+            env,
+            creator,
+            token,
+            contribution,
+            deposit,
+            size,
+            period_secs,
+            grace_secs,
+        )
     }
 
     /// Member only: join an Open circle, escrowing the deposit. Activates the
@@ -208,6 +194,37 @@ impl CircleContract {
         env.storage()
             .persistent()
             .remove(&DataKey::Member(circle_id, member));
+    }
+
+    /// Creator only, while Open: remove a member and refund their deposit.
+    /// The remaining members keep their join order, so payout order is
+    /// unchanged. The creator cannot be removed; they cancel instead.
+    pub fn remove_member(env: Env, circle_id: u32, creator: Address, member: Address) {
+        creator.require_auth();
+        let circle = storage::read_circle(&env, circle_id);
+        validation::validate_is_creator(&circle, &creator, &env);
+        validation::validate_circle_open(&circle, &env);
+        validation::validate_not_creator(&circle, &member, &env);
+        let state = storage::read_member(&env, circle_id, &member);
+        let mut members = storage::read_members(&env, circle_id);
+
+        if state.deposit_remaining > 0 {
+            token::Client::new(&env, &circle.token).transfer(
+                &env.current_contract_address(),
+                &member,
+                &state.deposit_remaining,
+            );
+        }
+        // `remove` shifts the later members down, so join order, which is
+        // payout order, is kept. Mirrors `leave`.
+        if let Some(index) = members.first_index_of(&member) {
+            members.remove(index);
+        }
+        storage::write_members(&env, circle_id, &members);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Member(circle_id, member.clone()));
+        events::remove(&env, circle_id, &member);
     }
 
     /// Creator only, while Open: cancel and refund every member's deposit.
